@@ -6,7 +6,7 @@ held-out task suite. Designed to close the loop in ~3 hours on a single 24 GB GP
 
 ```
 src/
-  env.py       # Two-tool environment + programmatic task generator + reward
+  env.py       # Tool-use env (train tools + held-out eval tools) + reward
   rollout.py   # Multi-turn rollout (shared by RL sampler and eval)
   data.py      # SFT data: Salesforce/APIGen-MT-5k (ShareGPT) -> tag protocol
   sft.py       # LoRA SFT via TRL SFTTrainer
@@ -24,7 +24,10 @@ bash scripts/run_pipeline.sh
 
 Knobs (env vars): `N_SFT`, `SFT_EPOCHS`, `RL_STEPS`, `RL_PROMPTS`, `RL_K`, `N_EVAL`.
 
-**Headline eval** (50 held-out tasks): base 0% → SFT 48% → RL 98% success.
+**Headline eval** (50 tasks per split): on the **train** split (base tools,
+in-domain) base 0% → SFT 54% → RL 96% success; on the **test** holdout split
+(disjoint tools: `record_read`, `gcd`, `lcm`, `digit_sum`) base 4% → SFT 92% →
+RL 98%. See [Train vs eval tools](#train-vs-eval-tools) below.
 Full metrics in [Results](#results) below.
 
 ---
@@ -33,7 +36,21 @@ Full metrics in [Results](#results) below.
 
 ### 1. Environment with verifiable rewards (`src/env.py`)
 
-Two tools, both completely deterministic:
+#### Train vs eval tools
+
+| Split   | When used                         | Tools exposed per task (disjoint sets) | Task families                                      |
+| ------- | --------------------------------- | -------------------------------------- | -------------------------------------------------- |
+| `train` | SFT env demos, GRPO, eval in-domain | `calculator`, `kv_lookup`              | 2-key / 3-key arithmetic after lookups             |
+| `test`  | Eval only (holdout)               | `record_read` + one of `gcd`/`lcm`/`digit_sum` | Read records → GCD/LCM, or read one record → digit sum |
+
+Train and holdout tool **names do not overlap** (`kv_lookup` vs `record_read` are
+the same lookup semantics under different schemas).
+
+GRPO always samples `split="train"`. Eval runs both splits by default
+(`--splits train test`) so you get in-domain numbers *and* whether the model
+transfers the tool-calling *behaviour* to brand-new tools it never saw in RL.
+
+Base tools (deterministic):
 
 
 | Tool         | Signature         | Behaviour                                                        |
@@ -41,8 +58,21 @@ Two tools, both completely deterministic:
 | `calculator` | `expression: str` | Evaluates a safe arithmetic AST (`+ - * / **`, parens).          |
 | `kv_lookup`  | `key: str`        | Looks up `key` in a per-task dict, returns value or `NOT_FOUND`. |
 
+Holdout eval tools (disjoint from train; never advertised during GRPO):
 
-Tasks are generated programmatically. Two families:
+
+| Tool          | Signature                    | Behaviour                              |
+| ------------- | ---------------------------- | -------------------------------------- |
+| `record_read` | `record_id: str`             | Same KB lookup as `kv_lookup`, new name/arg. |
+| `gcd`         | `a: int`, `b: int`           | Greatest common divisor.               |
+| `lcm`         | `a: int`, `b: int`           | Least common multiple.                 |
+| `digit_sum`   | `n: int`                     | Sum of decimal digits of `n`.          |
+
+Each task advertises only its own tool list in the system prompt; calling a train
+tool (e.g. `calculator` or `kv_lookup` on a holdout task) returns
+`ERROR: unknown tool`.
+
+**Train** tasks are generated programmatically. Two families:
 
 - *2-key* — “look up `alpha` and `bravo`, take their sum, multiply by 4.”
 - *3-key* — “look up three keys, compute `(v1 + v2) * v3`.”
@@ -90,7 +120,7 @@ checkpointing keeps the long sequences in memory.
 **Why this is the more honest setup.** The old pipeline synthesised SFT data
 from the *same* env, so SFT alone nearly solved the task. Training on
 out-of-domain real data instead means SFT teaches the general tool-calling
-*format/behaviour* (and, in practice, transfers ~48% zero-shot success), while
+*format/behaviour* (and, in practice, transfers ~54% zero-shot success), while
 the env-specific completion recipe — reliable `<answer>` emission, correct
 arithmetic, efficient turn count — comes from RL.
 
@@ -148,9 +178,18 @@ carries information about format.
 
 ### 5. Eval (`src/eval.py`)
 
-50 held-out tasks, greedy decoding. Run pre-SFT (base), post-SFT, and post-RL
-sequentially; print a side-by-side table; dump full trajectories (first 3 per
+50 tasks per split (`train` + `test` by default), greedy decoding, disjoint seed
+`999_001` from SFT/RL. Run pre-SFT (base), post-SFT, and post-RL sequentially;
+print one comparison table per split; dump full trajectories (first 3 per
 condition) to `results/eval_summary_trained_on_apigen.json`.
+
+```bash
+# In-domain only (matches what GRPO trained on):
+python3 -m src.eval --adapters rl=checkpoints/rl/final --splits train
+
+# Held-out tools only:
+python3 -m src.eval --adapters rl=checkpoints/rl/final --splits test
+```
 
 Metrics reported:
 
@@ -171,7 +210,7 @@ signals to spot regressions even when success rate is flat.
 | LoRA, not full FT                                                | 4-hour budget.                                                                                                      | A small ceiling on what RL can move.                                                  |
 | Custom env, not BFCL / τ-bench / Open Trajectory Gym             | Wanted 100% verifiable, no-graders rewards. BFCL needs OpenAI-style scoring infra and τ-bench needs a longer setup. | External benchmark comparability.                                                     |
 | Custom GRPO loop, not `trl.GRPOTrainer`                          | TRL's GRPOTrainer is single-turn. Multi-turn requires bending it.                                                   | TRL's PPO ratio clip, batched generation, vLLM integration.                           |
-| `APIGen-MT-5k` for SFT (not synthetic)                           | Real, diverse, human-verified multi-turn tool use; honest train/eval domain gap.                                    | Out-of-domain vs the env's two tools — SFT transfers format and ~half of correctness; RL still needed for the rest. |
+| `APIGen-MT-5k` for SFT (not synthetic)                           | Real, diverse, human-verified multi-turn tool use; honest train/eval domain gap.                                    | Out-of-domain vs the env's two tools — SFT transfers format and most correctness (incl. held-out tools); RL still needed for completion and polish. |
 | Convert to the env's tag protocol (not Qwen-native `tool_calls`) | SFT emit format == what `rollout.py` parses, no schema-translation drift.                                           | Doesn't exercise Qwen's structured tool-call API.                                     |
 | `transformers` + `peft`, not Unsloth                             | One fewer moving dep at 0.6B scale.                                                                                 | ~2× SFT speed.                                                                        |
 | REINFORCE form of GRPO (no ε clip)                               | Simpler, stable at this LR.                                                                                         | Robustness to larger step sizes.                                                      |
@@ -181,51 +220,67 @@ signals to spot regressions even when success rate is flat.
 ## Results
 
 Full pipeline run with defaults (512 APIGen trajectories × 2 SFT epochs, 40 GRPO
-steps, 50 held-out eval tasks, greedy decode). Saved to
+steps, 50 eval tasks per split, greedy decode). Saved to
 `results/eval_summary_trained_on_apigen.json`.
 
+### Split = `train` (in-domain, base tools)
 
 | metric                    | base   | sft    | rl     |
 | ------------------------- | ------ | ------ | ------ |
-| success_rate              | 0.0000 | 0.4800 | 0.9800 |
-| mean_reward               | −0.601 | 0.563  | 1.193  |
-| answer_emit_rate          | 0.1200 | 0.5200 | 1.0000 |
-| mean_turns                | 5.72   | 5.28   | 3.26   |
-| mean_valid_tool_calls     | 0.48   | 4.18   | 2.26   |
-| mean_malformed_or_unknown | 5.12   | 0.58   | 0.00   |
+| success_rate              | 0.0000 | 0.5400 | 0.9600 |
+| mean_reward               | −0.589 | 0.651  | 1.173  |
+| answer_emit_rate          | 0.1400 | 0.6000 | 1.0000 |
+| mean_turns                | 5.70   | 5.24   | 3.26   |
+| mean_valid_tool_calls     | 0.50   | 4.22   | 2.26   |
+| mean_malformed_or_unknown | 5.06   | 0.42   | 0.00   |
 
+### Split = `test` (held-out tools)
 
-**Base** — 0% success. The model occasionally emits something tool-shaped but
-mostly produces malformed output (~5.1 bad calls per episode) and rarely wraps a
-final answer (12% `answer_emit_rate`).
+| metric                    | base   | sft    | rl     |
+| ------------------------- | ------ | ------ | ------ |
+| success_rate              | 0.0400 | 0.9200 | 0.9800 |
+| mean_reward               | −0.622 | 1.078  | 1.157  |
+| answer_emit_rate          | 0.1200 | 0.9200 | 1.0000 |
+| mean_turns                | 5.80   | 3.96   | 3.46   |
+| mean_valid_tool_calls     | 0.32   | 2.88   | 2.40   |
+| mean_malformed_or_unknown | 5.36   | 0.16   | 0.06   |
 
-**+ SFT (`APIGen-MT-5k`, out-of-domain)** — Format transfer is clear:
-`mean_malformed_or_unknown` drops 5.1 → 0.6 and valid tool calls jump to 4.2.
-But SFT also carries surprising procedural transfer — **48% success** on env
-tasks the model was never trained on. The remaining gap is mostly *completion*:
-only 52% of rollouts emit `<answer>`, and episodes run long (5.3 turns, often
-over-calling relative to the 2–3 step recipes).
+**Base** — Near-zero success on both splits. The model occasionally emits
+something tool-shaped but mostly produces malformed output (~5 bad calls per
+episode) and rarely wraps a final answer (12–14% `answer_emit_rate`).
 
-**+ GRPO (40 steps)** — RL closes what SFT left open. Success 48% → 98%,
-`answer_emit_rate` → 1.0, malformed calls → 0. Mean turns fall to 3.3 and tool
-calls to 2.3 — the policy learns the env's lookup→calculate→answer recipe rather
-than spamming tools. `mean_reward` tracks the same story (−0.60 → 1.19). In-loop
-RL success in `checkpoints/rl/train_log.jsonl` rises from ~44% at step 0 to
-~94% by step 15.
+**+ SFT (`APIGen-MT-5k`, out-of-domain)** — Format transfer is clear on train:
+`mean_malformed_or_unknown` drops 5.1 → 0.4 and valid tool calls jump to 4.2.
+SFT also carries strong procedural transfer — **54% success** on in-domain env
+tasks it was never trained on, and **92%** on held-out tools (`record_read`,
+`gcd`/`lcm`/`digit_sum`) it has never seen. The remaining in-domain gap is
+mostly *completion*: only 60% of train rollouts emit `<answer>`, and episodes
+run long (5.2 turns, often over-calling relative to the 2–3 step recipes).
+
+**+ GRPO (40 steps)** — RL closes what SFT left open on train. Success 54% →
+96%, `answer_emit_rate` → 1.0, malformed calls → 0. Mean turns fall to 3.3 and
+tool calls to 2.3 — the policy learns the env's lookup→calculate→answer recipe
+rather than spamming tools. `mean_reward` tracks the same story (−0.59 → 1.17).
+On the holdout split RL adds a smaller lift (92% → 98%) because SFT already
+generalises the tool-calling behaviour to unseen tool names. In-loop RL success
+in `checkpoints/rl/train_log.jsonl` rises from ~44% at step 0 to ~94% by step
+15.
 
 So the honest out-of-domain setup works: SFT teaches the tag protocol and gets
-halfway on correctness; GRPO does the env-specific grounding. The failure modes
-I was watching for did *not* show up here — `mean_reward` and `success_rate`
-moved together, and KL stayed bounded (~0.02 by step 19).
+most of the way on correctness (including on disjoint eval tools); GRPO does the
+env-specific grounding and answer completion. The failure modes I was watching
+for did *not* show up here — `mean_reward` and `success_rate` moved together,
+and KL stayed bounded (~0.02 by step 19).
 
 ## What I'd do with a week instead of an afternoon
 
-1. **More tools, more task families.** Add a web-search stub, a date-arithmetic
-  tool, a unit-conversion tool. Mix task families so RL can't overfit a
-   single recipe.
+1. **More tools, more task families.** The holdout split already uses disjoint
+   tools (`record_read`, `gcd`, `lcm`, `digit_sum`); extend with web-search stubs,
+   date arithmetic, unit conversion, etc.
 2. **Broaden + align the SFT mix.** SFT now uses `APIGen-MT-5k` (retail/airline)
-  and already reaches 48% zero-shot success — but answer completion and
-  turn efficiency still need RL. A week's version would mix in
+  and already reaches 54% in-domain / 92% held-out-tool zero-shot success — but
+  answer completion and turn efficiency on the train split still need RL. A week's
+  version would mix in
   `xlam-function-calling-60k` *and* add a few `calculator`/`kv_lookup`-style
   trajectories to close the remaining domain gap before RL.
 3. **vLLM-backed rollouts.** Drop in vLLM for the sampling half of GRPO — easily

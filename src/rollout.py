@@ -19,7 +19,6 @@ from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from .env import (
     ANSWER_RE,
-    KNOWN_TOOLS,
     Task,
     TrajectoryStats,
     build_system_prompt,
@@ -42,7 +41,7 @@ class Trajectory:
 
 def _initial_messages(task: Task) -> list[dict[str, str]]:
     return [
-        {"role": "system", "content": build_system_prompt()},
+        {"role": "system", "content": build_system_prompt(task.tools)},
         {"role": "user", "content": task.prompt},
     ]
 
@@ -133,7 +132,8 @@ def rollout(
             result = "ERROR: malformed tool_call JSON"
         else:
             name = call.get("name")
-            if name not in KNOWN_TOOLS:
+            allowed = frozenset(task.tools)
+            if name not in allowed:
                 traj.stats.unknown_tool_calls += 1
             else:
                 traj.stats.valid_tool_calls += 1

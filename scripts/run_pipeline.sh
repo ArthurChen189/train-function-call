@@ -28,25 +28,26 @@ export TOKENIZERS_PARALLELISM=false
 export HF_HUB_ENABLE_HF_TRANSFER=1
 
 echo "== [0/4] env sanity check =="
-python -m src.env
+python3 -m src.env
 
-# echo "== [1/4] SFT (n=$N_SFT, epochs=$SFT_EPOCHS) =="
-# python -m src.sft \
-#   --base-model "$BASE_MODEL" \
-#   --n-train "$N_SFT" \
-#   --epochs "$SFT_EPOCHS" \
-#   --out "$SFT_OUT"
+echo "== [1/4] SFT (n=$N_SFT, epochs=$SFT_EPOCHS) =="
+python -m src.sft \
+  --base-model "$BASE_MODEL" \
+  --n-train "$N_SFT" \
+  --epochs "$SFT_EPOCHS" \
+  --out "$SFT_OUT"
 
 echo "== [2/4] Eval base + SFT (sanity check) =="
-python -m src.eval \
+python3 -m src.eval \
   --base-model "$BASE_MODEL" \
   --adapters sft="$SFT_OUT/final" \
   --n "$N_EVAL" \
+  --splits train test \
   --greedy \
   --out "results/eval_pre_rl.json"
 
 echo "== [3/4] GRPO RL (steps=$RL_STEPS, prompts=$RL_PROMPTS, k=$RL_K) =="
-python -m src.rl \
+python3 -m src.rl \
   --base-model "$BASE_MODEL" \
   --sft-adapter "$SFT_OUT/final" \
   --steps "$RL_STEPS" \
@@ -54,11 +55,12 @@ python -m src.rl \
   --k-rollouts "$RL_K" \
   --out "$RL_OUT"
 
-echo "== [4/4] Final eval: base vs SFT vs RL =="
-python -m src.eval \
+echo "== [4/4] Final eval: base vs SFT vs RL (train + held-out-tool test splits) =="
+python3 -m src.eval \
   --base-model "$BASE_MODEL" \
   --adapters sft="$SFT_OUT/final" rl="$RL_OUT/final" \
   --n "$N_EVAL" \
+  --splits train test \
   --greedy \
   --out "$EVAL_OUT"
 

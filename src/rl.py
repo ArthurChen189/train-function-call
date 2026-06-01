@@ -205,7 +205,7 @@ def main() -> None:
 
     with open(log_path, "w") as f:
         for step in range(args.steps):
-            tasks = sample_tasks(args.prompts_per_step, seed=args.seed + step)
+            tasks = sample_tasks(args.prompts_per_step, seed=args.seed + step, split="train")
             optim.zero_grad(set_to_none=True)
             metrics = grpo_step(
                 policy, ref_model, tokenizer, tasks,

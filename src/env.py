@@ -6,6 +6,14 @@ Why this env instead of Open Trajectory Gym / BFCL / tau-bench:
 - Two tools (`calculator`, `kv_lookup`) force at least 2-3 tool turns, which
   exercises the multi-turn loop without blowing up the rollout budget.
 
+Train/holdout tool split (held-out-tool generalisation):
+- The `train` split only exposes `calculator` and `kv_lookup`.
+- The `test` (holdout) split exposes a *disjoint* tool set: `record_read`
+  (lookup with a new name/schema), plus `gcd`, `lcm`, and `digit_sum`. No train
+  tool names appear at holdout time. Each task advertises only its tool list in
+  the system prompt so eval measures transfer of tool-calling behaviour, not
+  memorised tool names. Answers stay generator-computed and exactly verifiable.
+
 Tool-call protocol (decoupled from any specific chat template):
     Assistant emits:
         <tool_call>{"name": "calculator", "arguments": {"expression": "3+4"}}</tool_call>
@@ -30,6 +38,7 @@ from __future__ import annotations
 
 import ast
 import json
+import math
 import operator
 import random
 import re
@@ -82,30 +91,111 @@ def kv_lookup(key: str, kb: dict[str, Any]) -> str:
     return "NOT_FOUND"
 
 
+# ---------- Held-out tools (test split only) -------------------------------------
+# Deterministic and integer-valued so rewards stay exactly verifiable. The model
+# never sees these during SFT/RL; they exist purely to probe tool generalisation.
+
+def _as_int(value: Any) -> int:
+    """Coerce a JSON number or numeric string to int (raises on bad input)."""
+    if isinstance(value, bool):  # bool is an int subclass; reject it explicitly
+        raise ValueError("expected a number, got bool")
+    return int(value)
+
+
+def gcd(a: Any, b: Any) -> str:
+    """Greatest common divisor of two integers."""
+    try:
+        return str(math.gcd(_as_int(a), _as_int(b)))
+    except (TypeError, ValueError):
+        return "ERROR: gcd requires integer arguments 'a' and 'b'"
+
+
+def lcm(a: Any, b: Any) -> str:
+    """Least common multiple of two integers."""
+    try:
+        return str(math.lcm(_as_int(a), _as_int(b)))
+    except (TypeError, ValueError):
+        return "ERROR: lcm requires integer arguments 'a' and 'b'"
+
+
+def digit_sum(n: Any) -> str:
+    """Sum of the decimal digits of an integer."""
+    try:
+        return str(sum(int(d) for d in str(abs(_as_int(n)))))
+    except (TypeError, ValueError):
+        return "ERROR: digit_sum requires an integer argument 'n'"
+
+
+# ---------- Tool registry --------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Tool:
+    """A tool's advertised schema plus its dispatch function `(args, task) -> str`."""
+    name: str
+    description: str
+    parameters: dict[str, Any]
+    fn: Callable[[dict[str, Any], "Task"], str]
+
+    @property
+    def schema(self) -> dict[str, Any]:
+        return {"name": self.name, "description": self.description,
+                "parameters": self.parameters}
+
+
+def _obj(props: dict[str, Any], required: list[str]) -> dict[str, Any]:
+    return {"type": "object", "properties": props, "required": required}
+
+
+TOOLS: dict[str, Tool] = {
+    # --- base tools (seen during SFT/RL) ---
+    "calculator": Tool(
+        "calculator",
+        "Evaluate a basic arithmetic expression (+, -, *, /, **, parentheses).",
+        _obj({"expression": {"type": "string"}}, ["expression"]),
+        lambda a, t: calculator(a.get("expression", "")),
+    ),
+    "kv_lookup": Tool(
+        "kv_lookup",
+        "Look up the integer value associated with a key in the user's database.",
+        _obj({"key": {"type": "string"}}, ["key"]),
+        lambda a, t: kv_lookup(a.get("key", ""), t.kb),
+    ),
+    # --- holdout tools (test split only; names disjoint from train) ---
+    "record_read": Tool(
+        "record_read",
+        "Read the integer value stored under record_id in the task database.",
+        _obj({"record_id": {"type": "string"}}, ["record_id"]),
+        lambda a, t: kv_lookup(a.get("record_id", ""), t.kb),
+    ),
+    "gcd": Tool(
+        "gcd",
+        "Compute the greatest common divisor of two integers a and b.",
+        _obj({"a": {"type": "integer"}, "b": {"type": "integer"}}, ["a", "b"]),
+        lambda a, t: gcd(a.get("a"), a.get("b")),
+    ),
+    "lcm": Tool(
+        "lcm",
+        "Compute the least common multiple of two integers a and b.",
+        _obj({"a": {"type": "integer"}, "b": {"type": "integer"}}, ["a", "b"]),
+        lambda a, t: lcm(a.get("a"), a.get("b")),
+    ),
+    "digit_sum": Tool(
+        "digit_sum",
+        "Compute the sum of the decimal digits of an integer n.",
+        _obj({"n": {"type": "integer"}}, ["n"]),
+        lambda a, t: digit_sum(a.get("n")),
+    ),
+}
+
+TRAIN_TOOLS = ("calculator", "kv_lookup")         # train split only
+HOLDOUT_TOOLS = ("record_read", "gcd", "lcm", "digit_sum")  # test split only
+BASE_TOOLS = TRAIN_TOOLS  # default for train tasks / build_system_prompt()
+KNOWN_TOOLS = frozenset(TOOLS)                    # full registry (dispatch)
+assert frozenset(TRAIN_TOOLS).isdisjoint(HOLDOUT_TOOLS)
+
+
 # ---------- Task generation ------------------------------------------------------
-
-KNOWN_TOOLS = frozenset({"calculator", "kv_lookup"})
-
-TOOL_SCHEMA = [
-    {
-        "name": "calculator",
-        "description": "Evaluate a basic arithmetic expression (+, -, *, /, **, parentheses).",
-        "parameters": {
-            "type": "object",
-            "properties": {"expression": {"type": "string"}},
-            "required": ["expression"],
-        },
-    },
-    {
-        "name": "kv_lookup",
-        "description": "Look up the integer value associated with a key in the user's database.",
-        "parameters": {
-            "type": "object",
-            "properties": {"key": {"type": "string"}},
-            "required": ["key"],
-        },
-    },
-]
 
 
 @dataclass
@@ -115,6 +205,9 @@ class Task:
     kb: dict[str, int]
     answer: int  # exact integer answer
     target_turns: int = 3  # used for the turn-penalty in reward shaping
+    # Tool names advertised to the model for this task (built into the system
+    # prompt). Train tasks expose only base tools; test tasks add a held-out one.
+    tools: tuple[str, ...] = BASE_TOOLS
     meta: dict[str, Any] = field(default_factory=dict)
 
 
@@ -123,6 +216,8 @@ _KEY_POOL = [
     "india", "juliet", "kilo", "lima", "mike", "november", "oscar", "papa",
 ]
 
+
+# --- train split: base tools only ---
 
 def _gen_two_key_arith(rng: random.Random) -> Task:
     """Look up two values then combine them with a small arithmetic expression."""
@@ -148,7 +243,8 @@ def _gen_two_key_arith(rng: random.Random) -> Task:
         kb=kb,
         answer=answer,
         target_turns=3,
-        meta={"keys": [k1, k2], "op": op_sym, "mult": mult},
+        tools=BASE_TOOLS,
+        meta={"keys": [k1, k2], "op": op_sym, "mult": mult, "family": "two_key"},
     )
 
 
@@ -165,15 +261,78 @@ def _gen_three_key_arith(rng: random.Random) -> Task:
         f"Respond with the final integer wrapped in <answer>...</answer>."
     )
     return Task(prompt=prompt, kb=kb, answer=answer, target_turns=4,
-                meta={"keys": [k1, k2, k3]})
+                tools=BASE_TOOLS, meta={"keys": [k1, k2, k3], "family": "three_key"})
 
 
-_GENERATORS = [_gen_two_key_arith, _gen_two_key_arith, _gen_three_key_arith]
+# --- test split: each task requires a held-out tool the policy never trained on ---
+
+def _gen_gcd(rng: random.Random) -> Task:
+    k1, k2 = rng.sample(_KEY_POOL, 2)
+    v1, v2 = rng.randint(10, 99), rng.randint(10, 99)
+    distractors = rng.sample([k for k in _KEY_POOL if k not in (k1, k2)], 3)
+    kb = {k1: v1, k2: v2, **{d: rng.randint(10, 99) for d in distractors}}
+    answer = math.gcd(v1, v2)
+    prompt = (
+        f"Use record_read to read the values for record_ids '{k1}' and '{k2}', "
+        f"then use the gcd tool to compute the greatest common divisor of those "
+        f"two values. Respond with the final integer wrapped in <answer>...</answer>."
+    )
+    return Task(prompt=prompt, kb=kb, answer=answer, target_turns=3,
+                tools=("record_read", "gcd"), meta={"keys": [k1, k2], "family": "gcd"})
 
 
-def sample_tasks(n: int, seed: int) -> list[Task]:
+def _gen_lcm(rng: random.Random) -> Task:
+    k1, k2 = rng.sample(_KEY_POOL, 2)
+    v1, v2 = rng.randint(2, 20), rng.randint(2, 20)
+    distractors = rng.sample([k for k in _KEY_POOL if k not in (k1, k2)], 3)
+    kb = {k1: v1, k2: v2, **{d: rng.randint(2, 20) for d in distractors}}
+    answer = math.lcm(v1, v2)
+    prompt = (
+        f"Use record_read to read the values for record_ids '{k1}' and '{k2}', "
+        f"then use the lcm tool to compute the least common multiple of those two "
+        f"values. Respond with the final integer wrapped in <answer>...</answer>."
+    )
+    return Task(prompt=prompt, kb=kb, answer=answer, target_turns=3,
+                tools=("record_read", "lcm"), meta={"keys": [k1, k2], "family": "lcm"})
+
+
+def _gen_digit_sum(rng: random.Random) -> Task:
+    k = rng.choice(_KEY_POOL)
+    v = rng.randint(100, 999)
+    distractors = rng.sample([x for x in _KEY_POOL if x != k], 3)
+    kb = {k: v, **{d: rng.randint(100, 999) for d in distractors}}
+    answer = sum(int(d) for d in str(v))
+    prompt = (
+        f"Use record_read to read the value for record_id '{k}', then use the "
+        f"digit_sum tool to compute the sum of the digits of that value. "
+        f"Respond with the final integer wrapped in <answer>...</answer>."
+    )
+    return Task(prompt=prompt, kb=kb, answer=answer, target_turns=2,
+                tools=("record_read", "digit_sum"), meta={"keys": [k], "family": "digit_sum"})
+
+
+_TRAIN_GENERATORS = [_gen_two_key_arith, _gen_two_key_arith, _gen_three_key_arith]
+_TEST_GENERATORS = [_gen_gcd, _gen_lcm, _gen_digit_sum]
+
+
+def sample_tasks(n: int, seed: int, split: str = "train") -> list[Task]:
+    """Sample `n` tasks.
+
+    `split="train"`: tasks using TRAIN_TOOLS only (`calculator`, `kv_lookup`).
+    `split="test"`: holdout tasks using HOLDOUT_TOOLS only (disjoint names/schemas).
+    """
+    if split not in ("train", "test"):
+        raise ValueError(f"unknown split {split!r}; use 'train' or 'test'")
+    gens = _TRAIN_GENERATORS if split == "train" else _TEST_GENERATORS
+    allowed = frozenset(TRAIN_TOOLS if split == "train" else HOLDOUT_TOOLS)
     rng = random.Random(seed)
-    return [rng.choice(_GENERATORS)(rng) for _ in range(n)]
+    tasks = [rng.choice(gens)(rng) for _ in range(n)]
+    for t in tasks:
+        if frozenset(t.tools) - allowed:
+            raise AssertionError(f"split={split} task exposes tools outside {allowed}: {t.tools}")
+        if split == "test" and frozenset(t.tools) & frozenset(TRAIN_TOOLS):
+            raise AssertionError(f"holdout task must not expose train tools: {t.tools}")
+    return tasks
 
 
 # ---------- Tool dispatch + reward ----------------------------------------------
@@ -210,20 +369,22 @@ def parse_answer(text: str) -> int | None:
 
 
 def run_tool(call: dict[str, Any], task: Task) -> str:
+    """Dispatch a tool call. Only tools advertised on `task.tools` are allowed."""
     name = call.get("name")
     args = call.get("arguments") or {}
-    if name == "calculator":
-        return calculator(args.get("expression", ""))
-    if name == "kv_lookup":
-        return kv_lookup(args.get("key", ""), task.kb)
-    return f"ERROR: unknown tool '{name}'"
+    if name not in task.tools:
+        return f"ERROR: unknown tool '{name}'"
+    tool = TOOLS.get(name)
+    if tool is None:
+        return f"ERROR: unknown tool '{name}'"
+    return tool.fn(args, task)
 
 
 @dataclass
 class TrajectoryStats:
-    valid_tool_calls: int = 0  # calculator or kv_lookup calls that parsed and dispatched
+    valid_tool_calls: int = 0  # parsed calls dispatched to a registered tool
     malformed_tool_calls: int = 0  # invalid JSON, missing name, or turn with no tool_call/answer
-    unknown_tool_calls: int = 0  # parseable calls whose name is not calculator or kv_lookup
+    unknown_tool_calls: int = 0  # parseable calls whose name is not a registered tool
     turns: int = 0  # assistant turns taken before termination or max_turns
     final_answer: int | None = None  # integer from <answer>...</answer>, if emitted
     correct: bool = False  # final_answer equals task.answer
@@ -243,10 +404,13 @@ def compute_reward(task: Task, stats: TrajectoryStats) -> float:
 
 # ---------- System prompt builder -----------------------------------------------
 
-def build_system_prompt() -> str:
-    schema = json.dumps(TOOL_SCHEMA, indent=2)
+def build_system_prompt(tool_names: tuple[str, ...] | list[str] | None = None) -> str:
+    """Render the system prompt advertising `tool_names` (defaults to base tools)."""
+    if tool_names is None:
+        tool_names = BASE_TOOLS
+    schema = json.dumps([TOOLS[n].schema for n in tool_names], indent=2)
     return (
-        "You are a helpful assistant with access to two tools.\n\n"
+        "You are a helpful assistant with access to the following tools.\n\n"
         f"Available tools:\n{schema}\n\n"
         "To call a tool, emit exactly one tool call per assistant turn:\n"
         '  <tool_call>{"name": "<tool_name>", "arguments": {...}}</tool_call>\n'
@@ -258,10 +422,24 @@ def build_system_prompt() -> str:
 
 
 if __name__ == "__main__":
-    # Smoke test
-    tasks = sample_tasks(3, seed=0)
-    for t in tasks:
-        print("PROMPT:", t.prompt)
-        print("KB:", t.kb)
-        print("ANSWER:", t.answer)
-        print("---")
+    # Smoke test both splits + verify the held-out tools dispatch and score.
+    for split in ("train", "test"):
+        print(f"===== split={split} =====")
+        for t in sample_tasks(3, seed=0, split=split):
+            print("FAMILY:", t.meta.get("family"), "| TOOLS:", list(t.tools))
+            print("PROMPT:", t.prompt)
+            print("KB:", t.kb)
+            print("ANSWER:", t.answer)
+            print("---")
+    # Holdout tool dispatch sanity (train tool names must fail).
+    demo = sample_tasks(1, seed=1, split="test")[0]
+    keys = demo.meta["keys"]
+    rr = run_tool({"name": "record_read", "arguments": {"record_id": keys[0]}}, demo)
+    print(f"record_read -> {rr}")
+    bad = run_tool({"name": "kv_lookup", "arguments": {"key": keys[0]}}, demo)
+    assert "unknown tool" in bad, bad
+    name = demo.tools[-1]
+    args = ({"a": demo.kb[keys[0]], "b": demo.kb[keys[1]]} if name in ("gcd", "lcm")
+            else {"n": demo.kb[keys[0]]})
+    print(f"dispatch {name}{args} -> {run_tool({'name': name, 'arguments': args}, demo)} "
+          f"(answer={demo.answer})")
