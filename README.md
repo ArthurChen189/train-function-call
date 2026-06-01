@@ -24,11 +24,10 @@ bash scripts/run_pipeline.sh
 
 Knobs (env vars): `N_SFT`, `SFT_EPOCHS`, `RL_STEPS`, `RL_PROMPTS`, `RL_K`, `N_EVAL`.
 
-**Headline eval** (50 tasks per split): on the **train** split (base tools,
-in-domain) base 0% → SFT 54% → RL 96% success; on the **test** holdout split
-(disjoint tools: `record_read`, `gcd`, `lcm`, `digit_sum`) base 4% → SFT 92% →
-RL 98%. See [Train vs eval tools](#train-vs-eval-tools) below.
-Full metrics in [Results](#results) below.
+**Headline eval** (50 tasks per split): 
+- on the **train** split (base tools,
+in-domain) base 0% → SFT 54% → RL 96% success
+- on the **test** holdout split (disjoint tools: `record_read`, `gcd`, `lcm`, `digit_sum`) base 4% → SFT 92% → RL 98% success.
 
 ---
 
@@ -124,7 +123,7 @@ out-of-domain real data instead means SFT teaches the general tool-calling
 the env-specific completion recipe — reliable `<answer>` emission, correct
 arithmetic, efficient turn count — comes from RL.
 
-Defaults: 512 trajectories × 2 epochs.
+Defaults: 512 trajectories × 2 epochs. (Note that this is a subset of the APIGen-MT-5k dataset to filter trajectories with length > 6144 tokens.)
 
 ### 3. GRPO RL (`src/rl.py`)
 
@@ -272,37 +271,28 @@ env-specific grounding and answer completion. The failure modes I was watching
 for did *not* show up here — `mean_reward` and `success_rate` moved together,
 and KL stayed bounded (~0.02 by step 19).
 
-## What I'd do with a week instead of an afternoon
+## Future todos if I have more time
 
-1. **More tools, more task families.** The holdout split already uses disjoint
-   tools (`record_read`, `gcd`, `lcm`, `digit_sum`); extend with web-search stubs,
-   date arithmetic, unit conversion, etc.
+1. **More tools, more tasks, curriculum learning.** Add more real tools and tasks to the environment and SFT dataset. Add curriculum learning to the SFT and RL loop to gradually introduce more complex tasks and tools to the model.
 2. **Broaden + align the SFT mix.** SFT now uses `APIGen-MT-5k` (retail/airline)
   and already reaches 54% in-domain / 92% held-out-tool zero-shot success — but
   answer completion and turn efficiency on the train split still need RL. A week's
   version would mix in
   `xlam-function-calling-60k` *and* add a few `calculator`/`kv_lookup`-style
   trajectories to close the remaining domain gap before RL.
-3. **vLLM-backed rollouts.** Drop in vLLM for the sampling half of GRPO — easily
-  8× faster wall-clock, makes K=16 rollouts/prompt feasible.
-4. **Real external benchmark.** Add a τ-bench or BFCL slice as a *secondary*
-  eval, kept disjoint from training. Report both in-domain and out-of-domain.
+3. **SGLang-backed rollouts.** Drop in SGLang for the sampling half of GRPO - much faster inference thus making more rollouts per step possible.
+4. **Real external benchmark.** Add a $\tau^2$-bench and a BFCL subset as a *secondary* eval, kept disjoint from training. Report both in-domain and out-of-domain.
 5. **Ablate the reward.** Run the same RL with (a) only correctness reward,
   (b) full shaped reward, (c) shaped + tool-call cost penalty. Compare.
-6. **Process supervision experiment.** Score each turn (valid tool call?
-  sensible arg?), not just the trajectory. Compare per-turn vs per-trajectory
-   credit assignment.
-7. **PPO ratio clip + GAE-style off-policy correction** so we can run multiple
-  gradient steps per rollout batch without policy collapse.
-8. **Reference-model schedule.** Re-anchor `π_ref ← π_current` every N steps so
-  RL can keep moving without an ever-growing KL.
+6. **Try advantage clipping on a larger model.** With a larger model, experiment with advantage clipping during RL to allow multiple policy updates per rollout batch, while preventing the policy from drifting too far from the reference. This could help avoid policy collapse, letting the model learn more from each batch without sacrificing stability.
+7. **Reference-model schedule.** Re-anchor `π_ref ← π_current` every N steps so that RL can keep moving without an ever-growing KL.
 
 ## Reproducibility notes
 
 - Seeds: SFT draws from `APIGen-MT-5k` via a fixed canonical shuffle
 (`_SPLIT_SEED=1234`) that reserves a disjoint 256-row eval split; the env eval
 uses `seed=999_001` and RL uses `seed=42 + step`. The env eval tasks are
-freshly generated and never seen during SFT (different domain entirely) or RL.
+freshly generated (different numbers, different tools).
 - All assistant-only loss masking is delegated to TRL's chat-template-aware
 collator (`assistant_only_loss=True`) — no hand-rolled label masking.
 - The env smoke test runs first (`python -m src.env`) so format regressions
