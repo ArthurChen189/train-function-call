@@ -11,15 +11,15 @@ cd "$(dirname "$0")/.."
 BASE_MODEL="${BASE_MODEL:-Qwen/Qwen3-0.6B}"
 SFT_OUT="${SFT_OUT:-checkpoints/sft}"
 RL_OUT="${RL_OUT:-checkpoints/rl}"
-EVAL_OUT="${EVAL_OUT:-results/eval_summary.json}"
+EVAL_OUT="${EVAL_OUT:-results/eval_summary_trained_on_apigen.json}"
 
 # Small but non-trivial defaults. Override via env vars.
-N_SFT="${N_SFT:-512}"
+N_SFT="${N_SFT:-128}"
 SFT_EPOCHS="${SFT_EPOCHS:-2}"
 
-RL_STEPS="${RL_STEPS:-40}"
-RL_PROMPTS="${RL_PROMPTS:-4}"
-RL_K="${RL_K:-4}"
+RL_STEPS="${RL_STEPS:-20}"
+RL_PROMPTS="${RL_PROMPTS:-4}" # number of tasks per step
+RL_K="${RL_K:-4}" # number of rollouts per prompt
 
 N_EVAL="${N_EVAL:-50}"
 
@@ -30,12 +30,12 @@ export HF_HUB_ENABLE_HF_TRANSFER=1
 echo "== [0/4] env sanity check =="
 python -m src.env
 
-echo "== [1/4] SFT (n=$N_SFT, epochs=$SFT_EPOCHS) =="
-python -m src.sft \
-  --base-model "$BASE_MODEL" \
-  --n-train "$N_SFT" \
-  --epochs "$SFT_EPOCHS" \
-  --out "$SFT_OUT"
+# echo "== [1/4] SFT (n=$N_SFT, epochs=$SFT_EPOCHS) =="
+# python -m src.sft \
+#   --base-model "$BASE_MODEL" \
+#   --n-train "$N_SFT" \
+#   --epochs "$SFT_EPOCHS" \
+#   --out "$SFT_OUT"
 
 echo "== [2/4] Eval base + SFT (sanity check) =="
 python -m src.eval \

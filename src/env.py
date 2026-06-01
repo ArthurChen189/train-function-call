@@ -84,6 +84,8 @@ def kv_lookup(key: str, kb: dict[str, Any]) -> str:
 
 # ---------- Task generation ------------------------------------------------------
 
+KNOWN_TOOLS = frozenset({"calculator", "kv_lookup"})
+
 TOOL_SCHEMA = [
     {
         "name": "calculator",
